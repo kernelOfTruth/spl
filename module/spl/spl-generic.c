@@ -38,6 +38,8 @@
 #include <sys/proc.h>
 #include <sys/kstat.h>
 #include <sys/file.h>
+#include <sys/disp.h>
+#include <sys/random.h>
 #include <linux/kmod.h>
 #include <linux/math64_compat.h>
 #include <linux/proc_compat.h>
@@ -322,6 +324,81 @@ EXPORT_SYMBOL(ddi_strtol);
 EXPORT_SYMBOL(ddi_strtoll);
 EXPORT_SYMBOL(ddi_strtoull);
 
+/*
+ * Xorshift Pseudo Random Number Generator based on work by Sebastiano Vigna
+ * "An experimental exploration of Marsaglia's xorshift generators, scrambled"
+ * http://arxiv.org/pdf/1402.6246v2.pdf
+ *
+ * random_get_pseudo_bytes() is an API function on Illumos whose sole purpose
+ * is to provide bytes containing random numbers. It is mapped to /dev/urandom
+ * on Illumos, which uses a "FIPS 186-2 algorithm". No user of the SPL's
+ * random_get_pseudo_bytes() needs bytes that are of cryptographic quality, so
+ * we can implement it using a fast PRNG that we seed using Linux' actual
+ * equivalent to random_get_pseudo_bytes(). We do this by providing each CPU
+ * with an independent seed so that all calls to random_get_pseudo_bytes() are
+ * free of atomic instructions.
+ *
+ * A consequence of using a fast PRNG is that using random_get_pseudo_bytes()
+ * to generate words larger than 64-bit bits will paradoxically be limited to
+ * `2^64 - 1` possibilities. This is because we have a sequence of `2^64 - 1`
+ * 64-bit words and selecting the first will implicitly select the second. If a
+ * caller finds this behavior undesireable, random_get_bytes() could be used
+ * instead.
+ *
+ * XXX: Linux interrupt handlers that trigger within the critical section
+ * formed by `x = *xp;` and `*xp = x;` and call this function will see the same
+ * numbers. Nothing in the code currently calls this in an interrupt handler,
+ * so this is considered to be okay. If that becomes a problem, we could create
+ * a set of per-cpu variables for interrupt handlers and use them when
+ * in_interrupt() from linux/preempt_mask.h evaluates to true.
+ */
+static DEFINE_PER_CPU(uint64_t, spl_pseudo_entropy);
+
+int
+random_get_pseudo_bytes(uint8_t *ptr, size_t len)
+{
+	uint64_t x, *xp;
+	ASSERT(ptr);
+
+	if (len < 0)
+		return (0);
+
+	kpreempt_disable();
+	xp = &per_cpu(spl_pseudo_entropy, smp_processor_id());
+	x = *xp;
+
+	while (len) {
+		union {
+			uint64_t ui64;
+			uint8_t byte[sizeof (uint64_t)];
+		} entropy;
+		int i = MIN(len, sizeof (uint64_t));
+
+		x ^= x >> 12;
+		x ^= x << 25;
+		x ^= x >> 27;
+
+		len -= i;
+		entropy.ui64 = x * 2685821657736338717ULL;
+
+		if (i == sizeof (uint64_t)) {
+			*((uint64_t *)ptr) = entropy.ui64;
+			ptr += sizeof (uint64_t);
+			continue;
+		}
+
+		while (i--)
+			*ptr++ = entropy.byte[i];
+	}
+
+	*xp = x;
+	kpreempt_enable();
+
+	return (0);
+}
+
+EXPORT_SYMBOL(random_get_pseudo_bytes);
+
 int
 ddi_copyin(const void *from, void *to, size_t len, int flags)
 {
@@ -479,10 +556,29 @@ zone_get_hostid(void *zone)
 }
 EXPORT_SYMBOL(zone_get_hostid);
 
+static void
+__init spl_random_init(void)
+{
+	int i;
+
+	for (i = 0; i < NR_CPUS; i++) {
+		uint64_t *wordp = &per_cpu(spl_pseudo_entropy, i);
+		get_random_bytes(wordp, sizeof (uint64_t));
+		if (*wordp == 0) {
+			*wordp = ~0 - i;
+			printk("SPL: get_random_bytes() returned 0 "
+				"when generating random seed for CPU %d. "
+				"Setting initial seed to %llx.", i, *wordp);
+		}
+	}
+}
+
 static int
 __init spl_init(void)
 {
 	int rc = 0;
+
+	spl_random_init();
 
 	if ((rc = spl_kmem_init()))
 		goto out1;
